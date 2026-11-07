@@ -1,14 +1,16 @@
 # Task 4: Deployment topologies and trade-offs
 
-**Name / ชื่อ:**
+**Name / ชื่อ:** Putthitorn Chalitchaiya
 
-**Student ID / รหัสนิสิต:**
+**Student ID / รหัสนิสิต:** 6870197421
 
 This is **individual work**: each student completes and submits their own copy, in their own fork.
 
 *งานนี้เป็น**งานเดี่ยว** นิสิตแต่ละคนทำและส่งงานของตัวเอง ใน fork ของตัวเอง*
 
-**Scenario (A, B or C) / Scenario ที่เลือก:**
+**Scenario (A, B or C) / Scenario ที่เลือก:** A (Owner alerts)
+
+เลือก A เพราะเป็น alert แบบ real-time ที่ต้องคุมทั้งความเร็ว ความแม่น และจำนวน call ไป large model ซึ่ง cascade ช่วยลดได้
 
 Choose **one** scenario below. If the last digit of your student ID is odd, take A or B; if it is even, take B or C. Use your measurements from Tutorial 6 as evidence: cite run names from `results/runs.csv`. Answer in Thai or English.
 
@@ -58,9 +60,9 @@ The three most important quality requirements for your scenario, each with a num
 
 | # | Quality | Requirement |
 |---|---|---|
-| 1 | | |
-| 2 | | |
-| 3 | | |
+| 1 | Performance | alert ถึงเจ้าของร้านภายใน 2 วินาทีหลังโพสต์รีวิว (ยังต้องทดสอบที่ 40 รีวิว/วินาที) |
+| 2 | Capacity / Cost | รับได้ 40 รีวิว/วินาทีช่วงพีค โดยเรียก large model ไม่เกิน 20 calls/s |
+| 3 | Accuracy | alert ผิดไม่เกิน 6% ของ alert ทั้งหมด (t3-cache ผิด 6 จาก 107 = 5.6% วัดจากรีวิว 200 รายการ) |
 
 ## 2. Design / การออกแบบ
 
@@ -68,16 +70,44 @@ Your topology, the patterns you add, and a container-level diagram (C4 level 2).
 
 *topology ที่เลือก pattern ที่เพิ่ม และ diagram ระดับ container (C4 level 2) เขียนด้วย Mermaid*
 
+**Topology:** T3 Hybrid: small model อยู่ใน review service ส่วน large model แยกเป็นอีก service
+
+**Patterns:**
+- Cascade: small ตอบก่อน ถ้า confidence ต่ำกว่า 0.7 ค่อยส่งไป large
+- Cache: เช็ค cache ก่อนเรียกโมเดล รีวิวที่เคยเจอแล้วไม่ต้องคิดใหม่
+- Fallback: ถ้า large ไม่ตอบภายใน 1 วินาที เอารีวิวไปเข้าคิวให้ worker ทำทีหลัง และไม่ส่ง alert จากผลที่ยังไม่ชัวร์
+
+**Containers:**
+1. API gateway: รับ request จาก client แล้วส่งต่อให้ review service (HTTP)
+2. Review service + small model: เก็บรีวิว รัน small model ในตัว และคุม cascade
+3. Cache: เก็บ label ของรีวิวที่เคยเจอ
+4. Large model inference service: รัน large model รับ request จาก review service (HTTP)
+5. Message queue: เก็บรีวิวที่ยังไม่ได้ label ตอน large ไม่ตอบ
+6. Background worker: ดึงรีวิวจากคิวไปถาม large แล้วบันทึก label กลับไปที่ review service
+
+คิวมีไว้เก็บงานที่ค้างเท่านั้น เส้นทางหลักยังเป็น T3 ไม่ได้เปลี่ยนเป็น T4
+
 ```mermaid
 C4Container
-    title Your design: container diagram
-    %% Replace the example below with your own people, containers and relationships.
-    %% See the CampusEats C4 diagram in README.md for the full syntax.
-    Person(customer, "Customer", "Writes restaurant reviews")
+    title Scenario A: T3 Hybrid with cascade, cache and fallback queue
+    Person(customer, "Customer", "Posts restaurant reviews")
     System_Boundary(campuseats, "CampusEats") {
-        Container(review, "Review service", "Python, FastAPI", "What it does")
+        Container(gateway, "API gateway", "Python, FastAPI", "Single entry point for clients")
+        Container(review, "Review service + small model", "Python, FastAPI, scikit-learn", "Stores reviews, runs the small model in-process and controls the cascade (threshold 0.7)")
+        ContainerDb(cache, "Prediction cache", "LRU cache", "Labels of reviews already seen")
+        Container(large, "Large model inference service", "Python, FastAPI, scikit-learn", "Large model, max 20 calls/s")
+        ContainerQueue(queue, "Message queue", "Broker (W10)", "Reviews waiting for a label")
+        Container(worker, "Background worker", "Python", "Labels queued reviews later")
     }
-    Rel(customer, review, "Posts reviews", "HTTP/JSON")
+    Rel(customer, gateway, "Posts reviews", "HTTP/JSON")
+    Rel(gateway, review, "Forwards requests", "HTTP/JSON")
+    Rel(review, cache, "Looks up and stores labels")
+    Rel(review, large, "POST /predict when confidence < 0.7, timeout 1 s", "HTTP/JSON")
+    Rel(review, queue, "Enqueues review on timeout or error (fallback)")
+    Rel(queue, worker, "Delivers queued reviews")
+    Rel(worker, large, "POST /predict", "HTTP/JSON")
+    Rel(worker, review, "Saves label later", "HTTP/JSON")
+    UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 ```
 
 ## 3. Evidence / หลักฐาน
@@ -88,8 +118,14 @@ Which runs support your choice? Show the numbers and, for scenario A, the capaci
 
 | Run | What it shows / แสดงอะไร |
 |---|---|
-| | |
-| | |
+| t0-large | accuracy 93.5% alert ผิด 5 แต่ large calls 100% = 40 calls/s เกิน capacity |
+| t2-0.6 | accuracy 91.5% large calls 38% แต่ alert ผิด 10 เกือบสองเท่าของ large อย่างเดียว |
+| t2-0.7 | accuracy 93.0% alert ผิด 6 แต่ large calls 53% = 21.2 calls/s เกิน capacity |
+| t3-cache | threshold 0.7 กับ cache: accuracy 93.0% alert ผิด 6 large calls ลดเหลือ 38% p50 79 ms |
+
+จำนวน alert ผิดไม่มีใน `runs.csv` จึงนับเพิ่มโดยรันสองโมเดลแบบ offline กับรีวิว 200 รายการชุดเดียวกับ load test ซึ่งได้ accuracy ตรงกับ `runs.csv` ทุก run
+
+**Capacity:** 40 × 0.38 = 15.2 calls/s ไม่เกิน 20 calls/s เหลือ 4.8 calls/s (ถ้าสัดส่วน cache hit และ large calls ตอนใช้งานจริงใกล้กับที่วัดได้)
 
 ## 4. ADR
 
@@ -97,20 +133,25 @@ Use the ADR format from W5.
 
 *ใช้รูปแบบ ADR จาก W5*
 
-**Title:**
+**Title:** ใช้ T3 Hybrid + cascade 0.7 + cache + fallback queue สำหรับ owner alert
 
 **Status:** Proposed
 
-**Context:**
+**Context:** ช่วงพีคมี 40 รีวิว/วินาที ต้องส่ง alert ภายใน 2 วินาที แต่ large model รับได้แค่ 20 calls/s และ alert ผิดแย่กว่า alert ที่พลาด เพราะเจ้าของร้านจะเลิกเชื่อ alert
 
-**Decision:**
+**Decision:** รัน small model ใน review service ส่งไป large ผ่าน HTTP เฉพาะตอน confidence ต่ำกว่า 0.7 ใช้ cache กันการคิดซ้ำ และถ้า large ไม่ตอบให้เอารีวิวเข้าคิวไว้ทำทีหลัง
 
 **Consequences:**
-- Positive:
-- Negative:
+- Positive: accuracy 93.0% alert ผิด 6 จาก 107 (5.6%) น้อยกว่า threshold 0.6 ที่ผิด 10
+- Positive: cache ลด large calls จาก 53% เหลือ 38% ใช้ large แค่ 15.2 calls/s ไม่เกิน 20
+- Positive: ถ้า large ค้าง request ก็ไม่ค้างตาม
+- Negative: ระบบซับซ้อนขึ้น ต้องดูแล cache, queue และ worker เพิ่ม และ small ยังผิดแบบมั่นใจสูงได้จนส่ง alert ผิด
+- Negative: p50/p95 วัดที่ 10 request พร้อมกัน ไม่ใช่ 40 รีวิว/วินาที ยังบอกไม่ได้ว่าจะทัน 2 วินาทีตอนพีคจริง ต้อง load test เพิ่ม
 
 **Alternatives considered:** at least one topology you rejected, and why.
 
 *อย่างน้อยหนึ่ง topology ที่ไม่เลือก และเหตุผล*
 
->
+> - large อย่างเดียว (T1): แม่นสุด (93.5% ผิด 5) แต่ต้องใช้ 40 calls/s เกิน 20
+> - cascade 0.6: ใช้ large 38% เท่ากัน แต่ alert ผิด 10 เกือบสองเท่า
+> - cascade 0.7 ไม่มี cache: accuracy เท่ากัน แต่ต้องใช้ 21.2 calls/s เกิน capacity
